@@ -1,7 +1,9 @@
 """Convenience functions to help locate sources"""
-
+import os
 import warnings
+from functools import lru_cache
 from typing import Union, Optional
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pandas as pd
@@ -48,6 +50,9 @@ def _process_input_parameters(coords, sector=None, cycle=None, time=None):
 
     return coords, sector_mask
 
+@lru_cache(maxsize=None)
+def _get_wcs(sector: int, camera: int, ccd: int) -> WCS:
+    return WCS.from_sector(sector, camera, ccd)
 
 def get_observability_mask(wcs: WCS, coords: SkyCoord):
     """For given RAs and Decs, return an array of the same shape with True or False, where True indicates the point falls inside the WCS
@@ -134,16 +139,30 @@ def check_observability(
         Optional time to narrow down search. If a time is passed, will only search sector that encompasses that time.
     """
     coords, sector_mask = _process_input_parameters(coords, sector, cycle, time)
+    def _obs_worker(sector, camera, ccd, coords):
+        wcs = _get_wcs(sector, camera, ccd)
+        return (camera, ccd, get_observability_mask(wcs, coords))
+    
     observable = {}
     for sector, ra, dec, roll in pointings[sector_mask][
         ["Sector", "RA", "Dec", "Roll"]
     ]:
         observable[sector] = {}
-        for camera in np.arange(1, 5):
-            observable[sector][camera] = {}
-            for ccd in np.arange(1, 5):
-                wcs = WCS.from_sector(sector, camera, ccd)
-                observable[sector][camera][ccd] = get_observability_mask(wcs, coords)
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            futures = [
+                executor.submit(_obs_worker, sector, camera, ccd, coords)
+                for camera in range(1, 5)
+                for ccd in range(1, 5) 
+            ]
+
+            for future in futures:
+                camera, ccd, mask = future.result()
+                observable[sector].setdefault(camera, {})[ccd] = mask
+        # for camera in np.arange(1, 5):
+        #     observable[sector][camera] = {}
+        #     for ccd in np.arange(1, 5):
+        #         wcs = _get_wcs(sector, camera, ccd)
+        #         observable[sector][camera][ccd] = get_observability_mask(wcs, coords)
 
     sector = np.hstack(np.asarray(list(observable.keys()))[:, None] * np.ones(16, int))
     camera = np.hstack(
